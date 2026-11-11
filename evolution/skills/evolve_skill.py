@@ -33,6 +33,41 @@ from evolution.skills.skill_module import (
 console = Console()
 
 
+def build_gepa_optimizer(metric, iterations: int, optimizer_model: str):
+    """Build the DSPy 3.4 GEPA optimizer.
+
+    dspy 3.4 removed GEPA(max_steps=...) and requires an explicit
+    reflection LM; the requested iteration count is mapped onto the
+    metric-call budget instead. Constructing the optimizer performs no
+    model calls; compile() does.
+    """
+    return dspy.GEPA(
+        metric=metric,
+        max_metric_calls=max(3 * iterations, 12),
+        reflection_lm=dspy.LM(optimizer_model, temperature=1.0, max_tokens=32000),
+    )
+
+
+def extract_optimized_body(optimized_module) -> str:
+    """Return the optimized skill body from a compiled module.
+
+    GEPA mutates the named predictor's instructions
+    (optimized_module.predictor.predict), never module attributes:
+    reading optimized_module.skill_text back would return the seed body
+    unchanged (the export-path bug). Missing or empty instructions
+    raise instead of falling back to the seed body.
+    """
+    predictor = getattr(optimized_module, "predictor", None)
+    predict = getattr(predictor, "predict", None) if predictor is not None else None
+    signature = getattr(predict, "signature", None) if predict is not None else None
+    instructions = (
+        getattr(signature, "instructions", None) if signature is not None else None
+    )
+    if not isinstance(instructions, str) or not instructions.strip():
+        raise RuntimeError("Missing optimized instructions; refusing seed fallback")
+    return instructions
+
+
 def evolve(
     skill_name: str,
     iterations: int = 10,
@@ -153,10 +188,7 @@ def evolve(
     start_time = time.time()
 
     try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
+        optimizer = build_gepa_optimizer(skill_fitness_metric, iterations, optimizer_model)
 
         optimized_module = optimizer.compile(
             baseline_module,
@@ -164,7 +196,10 @@ def evolve(
             valset=valset,
         )
     except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
+        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version.
+        # Historical base behavior, kept for compatibility: a future explicit
+        # GEPA software-build mode must NOT count this fallback as a GEPA
+        # success.
         console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
         optimizer = dspy.MIPROv2(
             metric=skill_fitness_metric,
@@ -179,13 +214,20 @@ def evolve(
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
-    # The optimized module's instructions contain the evolved skill text
-    evolved_body = optimized_module.skill_text
+    # GEPA mutates the named predictor's instructions ('predictor.predict'),
+    # never module attributes: reading optimized_module.skill_text back would
+    # return the seed body unchanged (the T1 export-path bug). The optimizer's
+    # final candidate lives in the predictor signature instructions, which
+    # SkillModule.__init__ seeded with the skill body -- so this IS the
+    # evolved skill text. Missing/empty raises; no seed fallback.
+    evolved_body = extract_optimized_body(optimized_module)
     evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    # Validate the reassembled skill (frontmatter + body): _check_skill_structure
+    # requires frontmatter, so validating the bare body fails for every skill.
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -208,6 +250,8 @@ def evolve(
 
     holdout_examples = dataset.to_dspy_examples("holdout")
 
+    # Evaluate a fresh module built from exactly the body being exported.
+    exported_module = SkillModule(evolved_body)
     baseline_scores = []
     evolved_scores = []
     for ex in holdout_examples:
@@ -217,7 +261,7 @@ def evolve(
             baseline_score = skill_fitness_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
-            evolved_pred = optimized_module(task_input=ex.task_input)
+            evolved_pred = exported_module(task_input=ex.task_input)
             evolved_score = skill_fitness_metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 

@@ -104,11 +104,17 @@ class SkillModule(dspy.Module):
     def __init__(self, skill_text: str):
         super().__init__()
         self.skill_text = skill_text
-        self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+        # GEPA mutates predictor *instructions* (named predictor
+        # 'predictor.predict'), never call arguments or module attributes.
+        # Seeding the signature instructions with the skill body puts the body
+        # on GEPA's mutation surface, so the optimized instructions ARE the
+        # evolved skill text and the export round trip is lossless.
+        seeded_signature = self.TaskWithSkill.with_instructions(skill_text)
+        self.predictor = dspy.ChainOfThought(seeded_signature)
 
     def forward(self, task_input: str) -> dspy.Prediction:
         result = self.predictor(
-            skill_instructions=self.skill_text,
+            skill_instructions=self.predictor.predict.signature.instructions,
             task_input=task_input,
         )
         return dspy.Prediction(output=result.output)
